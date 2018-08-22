@@ -1,0 +1,446 @@
+/*
+ *   boolean framework for undertaker and satyr
+ *
+ * Copyright (C) 2012 Ralf Hackner <rh@ralf-hackner.de>
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ */
+
+#include "bool.h"
+#include "PicosatCNF.h"
+#include <iostream>
+#include <check.h>
+#include <string>
+#include <sstream>
+
+using namespace kconfig;
+
+START_TEST(simpleModel) {
+    PicosatCNF cnf;
+    // building the model
+
+    // v2 -> v1
+    // -2 1 0
+    cnf.pushVar(-2);
+    cnf.pushVar(1);
+    cnf.pushClause();
+
+    // v3 -> v1
+    // -3 1 0
+    cnf.pushVar(-3);
+    cnf.pushVar(1);
+    cnf.pushClause();
+
+    //try some assumptions
+    cnf.pushAssumption(3);
+    cnf.pushAssumption(2);
+
+    fail_unless(cnf.checkSatisfiable());
+    fail_unless(cnf.deref(1) == true);
+    fail_unless(cnf.deref(2) == true);
+    fail_unless(cnf.deref(3) == true);
+
+    //try other assumptions
+    cnf.pushAssumption(-1);
+
+    fail_unless(cnf.checkSatisfiable());
+    fail_unless(cnf.deref(1) == false);
+    fail_unless(cnf.deref(2) == false);
+    fail_unless(cnf.deref(3) == false);
+
+    //unsatisfiable assumptions
+    cnf.pushAssumption(2);
+    cnf.pushAssumption(-1);
+
+    fail_if(cnf.checkSatisfiable());
+} END_TEST;
+
+START_TEST(moreComplexModel) {
+    PicosatCNF cnf;
+
+    // v2 -> v1
+    // -2 1 0
+    cnf.pushVar(-2);
+    cnf.pushVar(1);
+    cnf.pushClause();
+
+    // v3 -> v1
+    // -3 1 0
+    cnf.pushVar(-3);
+    cnf.pushVar(1);
+    cnf.pushClause();
+
+    // v4 -> v1
+    // -4 1 0
+    cnf.pushVar(-4);
+    cnf.pushVar(1);
+    cnf.pushClause();
+
+    // v5 -> (v2 || !v3)
+    //-5 2 -3 0
+    cnf.pushVar(-5);
+    cnf.pushVar(2);
+    cnf.pushVar(-3);
+    cnf.pushClause();
+
+    // v6 -> (v2 || v4)
+    //-6 2 4 0
+    cnf.pushVar(-6);
+    cnf.pushVar(2);
+    cnf.pushVar(4);
+    cnf.pushClause();
+
+    // !v2
+    //-2 0
+    cnf.pushVar(-2);
+    cnf.pushClause();
+
+    // v5
+    //5 0
+    cnf.pushVar(5);
+    cnf.pushClause();
+
+    // v6
+    //6 0
+    cnf.pushVar(6);
+    cnf.pushClause();
+
+    fail_unless(cnf.checkSatisfiable());
+} END_TEST;
+
+START_TEST(sequentialUsage) {
+    PicosatCNF satisfiable;  // build a satisfiable model
+
+    // v1 || !v1
+    satisfiable.pushVar(1);
+    satisfiable.pushVar(-1);
+    satisfiable.pushClause();
+
+    fail_unless(satisfiable.checkSatisfiable());
+
+    PicosatCNF unsatisfiable; // build an unsatisfiable model
+
+    // v1 && !v1
+    unsatisfiable.pushVar(1);
+    unsatisfiable.pushClause();
+    unsatisfiable.pushVar(-1);
+    unsatisfiable.pushClause();
+
+    fail_if(unsatisfiable.checkSatisfiable());
+
+    PicosatCNF satisfiable1;   // building the model
+
+    // v1 || !v1
+    satisfiable1.pushVar(1);
+    satisfiable1.pushVar(-1);
+    satisfiable1.pushClause();
+
+    fail_unless(satisfiable1.checkSatisfiable());
+} END_TEST;
+
+START_TEST(parallelUsage) {
+    PicosatCNF satisfiable;
+    PicosatCNF unsatisfiable;
+    // building the model
+
+    // v1 || !v1
+    satisfiable.pushVar(1);
+    satisfiable.pushVar(-1);
+    satisfiable.pushClause();
+
+     // v1 && !v1
+    unsatisfiable.pushVar(1);
+    unsatisfiable.pushClause();
+    unsatisfiable.pushVar(-1);
+    unsatisfiable.pushClause();
+
+    fail_unless(satisfiable.checkSatisfiable());
+    fail_if(unsatisfiable.checkSatisfiable());
+
+    fail_unless(satisfiable.checkSatisfiable());
+    fail_if(unsatisfiable.checkSatisfiable());
+
+    fail_unless(satisfiable.checkSatisfiable());
+    fail_unless(satisfiable.checkSatisfiable());
+    fail_unless(satisfiable.checkSatisfiable());
+
+    fail_if(unsatisfiable.checkSatisfiable());
+    fail_if(unsatisfiable.checkSatisfiable());
+
+    fail_unless(satisfiable.checkSatisfiable());
+    fail_if(unsatisfiable.checkSatisfiable());
+} END_TEST;
+
+
+START_TEST(toFile) {
+    std::stringstream file;
+
+    PicosatCNF cnf;
+
+    // building the model
+
+    // !v2 || v1
+    cnf.pushVar(-2);
+    cnf.pushVar(1);
+    cnf.pushClause();
+
+    // !v3 || v1
+    cnf.pushVar(-3);
+    cnf.pushVar(1);
+    cnf.pushClause();
+
+    // !v4 || v2 || v3
+    cnf.pushVar(-4);
+    cnf.pushVar(2);
+    cnf.pushVar(3);
+    cnf.pushClause();
+
+    cnf.toStream(file);
+
+    std::string cmp(
+        "c File Format Version: 2.0\n"
+        "c Generated by satyr\n"
+        "c Type info:\n"
+        "c c sym <symbolname> <typeid>\n"
+        "c with <typeid> being an integer out of:\n"
+        "c enum {S_BOOLEAN=1, S_TRISTATE=2, S_INT=3, S_HEX=4, S_STRING=5, S_OTHER=6}\n"
+        "c variable names:\n"
+        "c c var <variablename> <cnfvar>\n"
+        "p cnf 4 3\n"
+        "-2 1 0\n"
+        "-3 1 0\n"
+        "-4 2 3 0\n"
+    );
+    fail_unless(file.str() == cmp,
+                "Expected:\n%s\n\nGot:\n%s", cmp.c_str(), file.str().c_str());
+} END_TEST;
+
+START_TEST(toFileWithSymbolTable) {
+    std::stringstream file;
+
+    PicosatCNF cnf;
+    std::string v1("v1");
+    std::string v2("v2");
+    std::string v3("v3");
+    std::string v4("v4");
+
+    cnf.setCNFVar(v1, 1);
+    cnf.setCNFVar(v2, 2);
+    cnf.setCNFVar(v3, 3);
+    cnf.setCNFVar(v4, 4);
+
+    cnf.addMetaValue("ALWAYS_ON", "v4");
+    cnf.addMetaValue("ALWAYS_ON", "v5");
+    cnf.addMetaValue("ALWAYS_OFF", "v1");
+
+    // building the model
+
+    // !v2 || v1
+    cnf.pushVar(v2, false);
+    cnf.pushVar(v1, true);
+    cnf.pushClause();
+
+    // !v3 || v1
+    cnf.pushVar(v3, false);
+    cnf.pushVar(v1, true);
+    cnf.pushClause();
+
+    // !v4 || v2 || v3
+    cnf.pushVar(v4, false);
+    cnf.pushVar(v2, true);
+    cnf.pushVar(v3, true);
+    cnf.pushClause();
+
+    cnf.toStream(file);
+
+    std::string cmp(
+        "c File Format Version: 2.0\n"
+        "c Generated by satyr\n"
+        "c Type info:\n"
+        "c c sym <symbolname> <typeid>\n"
+        "c with <typeid> being an integer out of:\n"
+        "c enum {S_BOOLEAN=1, S_TRISTATE=2, S_INT=3, S_HEX=4, S_STRING=5, S_OTHER=6}\n"
+        "c variable names:\n"
+        "c c var <variablename> <cnfvar>\n"
+        "c meta_value ALWAYS_OFF v1\n"
+        "c meta_value ALWAYS_ON v4 v5\n"
+        "c var v1 1\n"
+        "c var v2 2\n"
+        "c var v3 3\n"
+        "c var v4 4\n"
+        "p cnf 4 3\n"
+        "-2 1 0\n"
+        "-3 1 0\n"
+        "-4 2 3 0\n"
+    );
+    fail_unless(file.str() == cmp,
+                "Expected:\n%s\n\nGot:\n%s", cmp.c_str(), file.str().c_str());
+} END_TEST;
+
+START_TEST(readCnfFileWithInts) {
+    std::stringstream file;
+
+    file << "c trivial test model\n";
+    file << "p cnf 6 8\n";
+    // v2 -> v1
+    file << "-2 1 0\n";
+    // v3 -> v1
+    file << "-3 1 0\n";
+    // v4 -> v1
+    file << "-4 1 0\n";
+    // v5 -> (v2 || !v3)
+    file << "-5 2 -3 0\n";
+    // v5 -> (v2 || v4)
+    file << "-6 2 4 0\n";
+    // !v2
+    file << "-2 0\n";
+    // v5
+    file << "5 0\n";
+    // v5
+    file << "6 0\n";
+
+    PicosatCNF cnf;
+    cnf.readFromStream(file);
+
+    fail_unless(cnf.checkSatisfiable());
+    fail_unless(cnf.deref(1) == true);
+    fail_unless(cnf.deref(2) == false);
+    fail_unless(cnf.deref(3) == false);
+    fail_unless(cnf.deref(4) == true);
+    fail_unless(cnf.deref(5) == true);
+    fail_unless(cnf.deref(6) == true);
+} END_TEST;
+
+START_TEST(readCnfFileWithStrings) {
+    std::stringstream file;
+
+    file << "c trivial test model\n";
+    file << "c ALWAYS_ON v4 v5\n";
+    file << "c ALWAYS_OFF v2\n";
+    file << "c var v1 1\n";
+    file << "c var v2 2\n";
+    file << "c var v3 3\n";
+    file << "c var v4 4\n";
+    file << "c var v5 5\n";
+    file << "c var v6 6\n";
+    file << "p cnf 6 5\n";
+    // v2 -> v1
+    file << "-2 1 0\n";
+    // v3 -> v1
+    file << "-3 1 0\n";
+    // v4 -> v1
+    file << "-4 1 0\n";
+    // v5 -> (v2 || !v3)
+    file << "-5 2 -3 0\n";
+    // v6 -> (v2 || v4)
+    file << "-6 2 4 0\n";
+
+    PicosatCNF cnf;
+    cnf.readFromStream(file);
+
+    std::string v1("v1");
+    std::string v2("v2");
+    std::string v3("v3");
+    std::string v4("v4");
+    std::string v5("v5");
+    std::string v6("v6");
+
+    cnf.pushAssumption(v2, false);
+    cnf.pushAssumption(v5, true);
+    cnf.pushAssumption(v6, true);
+
+    fail_unless(cnf.checkSatisfiable());
+    fail_unless(cnf.deref(v1) == true);
+    fail_unless(cnf.deref(v2) == false);
+    fail_unless(cnf.deref(v3) == false);
+    fail_unless(cnf.deref(v4) == true);
+    fail_unless(cnf.deref(v5) == true);
+    fail_unless(cnf.deref(v6) == true);
+} END_TEST;
+
+START_TEST(addClausesToCnfFromFile) {
+    std::string v1("v1");
+    std::string v2("v2");
+    std::string v3("v3");
+    std::string v4("v4");
+    std::string v5("v5");
+    std::string v6("v6");
+
+    std::stringstream file;
+    file << "c trivial test model\n";
+    file << "c var v1 1\n";
+    file << "c var v2 2\n";
+    file << "c var v3 3\n";
+    file << "c var v4 4\n";
+    file << "c var v5 5\n";
+    file << "c var v6 6\n";
+    file << "p cnf 6 5\n";
+    // v2 -> v1
+    file << "-2 1 0\n";
+    // v3 -> v1
+    file << "-3 1 0\n";
+    // v4 -> v1
+    file << "-4 1 0\n";
+    // v5 -> (v2 || !v3)
+    file << "-5 2 -3 0\n";
+
+    PicosatCNF cnf;
+    cnf.readFromStream(file);
+
+    // v6 -> (v2 || v4)
+    cnf.pushVar(-6);
+    cnf.pushVar(2);
+    cnf.pushVar(4);
+    cnf.pushClause();
+
+    cnf.pushAssumption(v2, false);
+    cnf.pushAssumption(v5, true);
+    cnf.pushAssumption(v6, true);
+
+    fail_unless(cnf.checkSatisfiable());
+    fail_unless(cnf.deref(v1) == true);
+    fail_unless(cnf.deref(v2) == false);
+    fail_unless(cnf.deref(v3) == false);
+    fail_unless(cnf.deref(v4) == true);
+    fail_unless(cnf.deref(v5) == true);
+    fail_unless(cnf.deref(v6) == true);
+} END_TEST;
+
+Suite *cond_block_suite(void) {
+    Suite *s  = suite_create("PicosatCNF-test");
+    TCase *tc = tcase_create("PicosatCNF");
+
+    tcase_add_test(tc, simpleModel);
+    tcase_add_test(tc, moreComplexModel);
+    tcase_add_test(tc, sequentialUsage);
+    tcase_add_test(tc, parallelUsage);
+    tcase_add_test(tc, toFile);
+    tcase_add_test(tc, toFileWithSymbolTable);
+    tcase_add_test(tc, readCnfFileWithInts);
+    tcase_add_test(tc, readCnfFileWithStrings);
+    tcase_add_test(tc, addClausesToCnfFromFile);
+    suite_add_tcase(s, tc);
+    return s;
+}
+
+int main() {
+    Suite *s = cond_block_suite();
+    SRunner *sr = srunner_create(s);
+    srunner_run_all(sr, CK_NORMAL);
+    int number_failed = srunner_ntests_failed(sr);
+    srunner_free(sr);
+
+    return (number_failed == 0) ? EXIT_SUCCESS : EXIT_FAILURE;
+}

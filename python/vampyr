@@ -1,0 +1,515 @@
+#!/usr/bin/env python2
+
+"""vampyr - analyzes feature dependencies in Linux source files"""
+
+# Copyright (C) 2011 Christian Dietrich <christian.dietrich@informatik.uni-erlangen.de>
+# Copyright (C) 2011-2012 Reinhard Tartler <tartler@informatik.uni-erlangen.de>
+# Copyright (C) 2012 Christoph Egger <siccegge@informatik.uni-erlangen.de>
+# Copyright (C) 2012 Valentin Rothberg <valentinrothberg@googlemail.com>
+# Copyright (C) 2014 Stefan Hengelein <stefan.hengelein@fau.de>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import sys
+
+sys.path = [os.path.join(os.path.dirname(sys.path[0]), 'lib',
+                         'python%d.%d' % (sys.version_info[0],
+                                          sys.version_info[1]),
+                         'site-packages')] + sys.path
+
+import vamos.tools as tools
+import vamos.vampyr.BuildFrameworks as BuildFrameworks
+import vamos.golem.kbuild as kbuild
+import vamos.vampyr.utils as utils
+from vamos.model import get_model_for_arch
+from vamos.vampyr.Messages import MessageContainer
+
+import glob
+import logging
+import pprint
+import tempfile
+from optparse import OptionParser
+
+
+def do_checks(options, filename, configs, tool):
+    """returns a Message with errors"""
+    errors = MessageContainer()
+
+    print "%s: Checking %d configuration(s): %s" \
+        % (filename, len(configs), ", ".join([c.filename() for c in configs]))
+
+    logging.info("Checking file %s with tool '%s' and options: '%s'",
+                 filename, tool, options['args'][tool])
+
+    for c in configs:
+        if not hasattr(c, "call_" + tool):
+            logging.error("Tool '%s' not supported by this build system for %s",
+                          tool, c)
+            return errors
+
+        try:
+            analyzer = getattr(c, "call_" + tool)
+        except:
+            raise RuntimeError("Couldn't call analyzer '%s'" % tool)
+
+        # for kconfig, this will automatically try to expand the configuration
+        # for bare, this will be a noop
+        c.switch_to()
+
+        try:
+            msgs = analyzer(filename)
+        except RuntimeError as error:
+            logging.error(error)
+            continue
+
+        reportfilename = c.filename() + '.report.' + tool
+        logging.debug("%s: detected %d messages with tool '%s'", reportfilename, len(msgs), tool)
+
+        with open(reportfilename, 'w') as reportfile:
+            report = set()
+            for msg in msgs:
+                # Discard messages from other files
+                if options['exclude_others']:
+                    if not filename in msg.location:
+                        logging.debug("Discarded error messge (--exclude-others): %s", repr(msg))
+                        continue
+                errors.add_message(c, msg)
+                report.add(msg.get_message())
+            reportfile.write("\n".join(sorted(report)))
+
+    return errors
+
+
+def handle_file(options, filename):
+
+    framework = options['framework']
+    configs = framework.calculate_configurations(filename)
+    reference_config = None
+
+    for tool in options['call']:
+        if tool == 'spatch' and options.has_key('stdconfig'):
+            # for spatch, we always need the std config for filtering out messages
+            # that also appear in this config
+            reference_config = framework.get_stdconfig(filename, verify=False)
+        else:
+            # for other tools, only add if this configuration actually builds it.
+            reference_config = framework.get_stdconfig(filename, verify=True)
+
+        if reference_config:
+            configs.append(reference_config)
+
+        if framework.identifier() == 'kbuild' and len(configs) < 2:
+            logging.info("File %s has only %d configurations, skipping",
+                         filename, len(configs))
+            continue
+
+        messages = do_checks(options, filename, configs, tool)
+        logging.info("Found %d configuration dependent errors",
+                     len(messages))
+
+        if len(messages) > 0:
+            print "  ---- Found %d messages with %s in %s ----" % (len(messages),
+                                                                   tool, filename)
+            for m in messages:
+                print "%s (in configs: %s)" % (m.get_message(),
+                     ", ".join(sorted([c.filename() for c in m.in_configurations])))
+            print "  --------------------------------------------------"
+
+
+def do_dead_analysis(wl_dict, options):
+    for arch in wl_dict.keys():
+        if not get_model_for_arch(arch):
+            logging.info("No model found for architecture %s, " +
+                         "skipping dead block analysis", arch)
+            continue
+        with tempfile.NamedTemporaryFile() as tmpfile:
+            tmpfile.write("\n".join(wl_dict[arch]))
+            tmpfile.flush()
+            current_model=get_model_for_arch(arch)
+            # failok=True, if applied on a problematic file (e.g.,
+            # kernel/time.c), undertaker will signal an error. In this
+            # case, we want to proceed nevertheless!
+            tools.execute("undertaker -j dead -m %s -t %d -b %s" \
+                        % (current_model, options['threads'], tmpfile.name),
+                    failok=True)
+
+
+def analyze_variability(source_files, options):
+    # this method has too many branches and statements
+    # pylint: disable=R0912
+
+    bf = options['framework']
+
+    # bf.analyze_configuration_coverage has hardcoded fields with allyesconfig
+    if bf.options.has_key('stdconfig') and bf.options['stdconfig'] != 'allyesconfig':
+        logging.error("Overriding standard config %s to 'allyesconfig",
+                      bf.options['stdconfig'])
+        bf.options['stdconfig'] = 'allyesconfig'
+
+    # If there is no fixed architecture, then have to guess the 'best'
+    # architecture for each file individually. However, the user might
+    # request checking for files for which the best architecture may
+    # vary. Therefore, we need to group up the worklists by their
+    # architecture, as we need to run undertaker's dead analysis on each
+    # architecture individually.
+    wl_dict = dict()
+    reset_arch = False
+    for f in source_files:
+        if not os.path.exists(f):
+            logging.error("Skipping non-existing file %s", f)
+            continue
+
+        if not options.has_key('arch') or not options['arch']:
+            # NB: In that case we have to explicitly unset the architecture
+            #     in the buildframework each time we analyze a new file!
+            logging.info("Guessing architecture for %s", f)
+            arch, _ = kbuild.guess_arch_from_filename(f)
+            reset_arch = True
+        else:
+            arch = options['arch']
+
+        if not wl_dict.has_key(arch):
+            wl_dict[arch] = set()
+        wl_dict[arch].add(f)
+
+        for dead in glob.glob("%s*dead" % f):
+            logging.debug("Removing stale defect file %s", dead)
+            os.unlink(dead)
+
+    do_dead_analysis(wl_dict, options)
+
+    for f in source_files:
+        if not os.path.exists(f):
+            logging.error("Skipping non-existing file %s", f)
+            continue
+
+        logging.info("Analyzing %s", f)
+        if reset_arch:
+            bf.options['arch'], bf.options['subarch'] = None, None
+        try:
+            results = bf.analyze_configuration_coverage(f)
+        except BuildFrameworks.EmptyLinumMapException:
+            logging.error("Analysis of %s failed, skipping.", f)
+            continue
+        # add dead/undead statistics
+        results['dead blocks']   = [x.split(".")[-4] for x in glob.glob("%s*.dead" % f)]
+        results['undead blocks'] = [x.split(".")[-4] for x in glob.glob("%s*.undead" % f)]
+        reportname = f + ".coverage"
+        if 'arch' in options and options['arch']:
+            reportname += '.' + options['arch']
+        with open(reportname, "w+") as fd:
+            fd.write(pprint.pformat(results))
+            print "coverage report dumped to " + reportname
+
+        def to_lines(blocks):
+            return sum([results["linum_map"][x] for x in blocks])
+
+        print "%s: Covered %d/%d (%d/%d) blocks, %d/%d (%d/%d) lines, %d (%d) deads" % \
+            (f,
+             len(results['blocks_covered']), len(results['blocks_total']),
+             len(results['blocks_covered'] & results['configuration_blocks']),
+             len(results['blocks_total'] & results['configuration_blocks']),
+
+             to_lines(results["blocks_covered"]),
+             to_lines(results["blocks_total"]),
+             to_lines(results["blocks_covered"] & results["configuration_blocks"]),
+             to_lines(results["blocks_total"] & results["configuration_blocks"]),
+
+             len(results["dead blocks"]),
+             len(set(results["dead blocks"]) & results["configuration_blocks"]))
+
+        if len(results['blocks_covered'] - results['blocks_total']) > 0:
+            logging.error("File %s covered more blocks than available: %d > %d",
+                          f, len(results['blocks_covered']), len(results['blocks_total']))
+
+        if results['lines_covered'] > results['lines_total']:
+            logging.error("File %s covered more lines than available: %d > %d",
+                          f, results['lines_covered'], results['lines_total'])
+
+        for dead in results['dead blocks']:
+            if dead in results['blocks_covered']:
+                logging.error("Block %s in %s is dead but still covered", dead, f)
+
+
+def expand_partial_configurations(framework, source_files):
+    success = set()
+    fail = set()
+
+    for f in source_files:
+        # santity check for allowing 'golem sched/kernel.c.config*'
+        # without stumbling over .expanded files
+        if f.endswith('.expanded'):
+            logging.info("Ignoring %s", f)
+            continue
+
+        configs = framework.calculate_configurations(f)
+        logging.info("%s: processing %d configurations", f, len(configs))
+
+        for config in configs:
+            logging.debug("Checking Config %s", config.filename())
+            try:
+                config.expand(verify=True)
+                success.add(config)
+                logging.info("OK:   " + config.filename())
+            except utils.ExpansionError:
+                fail.add(config)
+                logging.info("FAIL: " + config.filename())
+
+    return (success, fail)
+
+
+def check_tool(tool):
+    """ check if the specified tools are available in the default search path """
+    if tool == 'gcc':
+        if not tools.check_tool('gcc --version'):
+            sys.exit("gcc not found!")
+    elif tool == 'sparse':
+        if not tools.check_tool('sparse'):
+            sys.exit("sparse not found!")
+    elif tool == 'spatch':
+        if not (tools.check_tool('vampyr-spatch-wrapper --help') and
+                tools.check_tool("spatch")):
+            sys.exit("spatch not found!")
+    elif tool == 'clang':
+        if not tools.check_tool('clang --version'):
+            sys.exit("clang not found!")
+    else:
+        sys.exit("Unsupported tool '%s'" % tool)
+
+
+def add_default_options(call, tool, options):
+    """ add default options if not set by user """
+    if (call == 'gcc' and 'gcc' not in options['args']):
+        options['args']['gcc'] = "-Wno-unused"
+
+    if (call == 'clang' and 'clang' not in options['args']):
+        options['args']['clang'] = ""
+
+    if (call == 'sparse' and 'sparse' not in options['args']):
+        options['args']['sparse'] = "-Wsparse-all"
+
+    if (call == 'spatch' and 'spatch' not in options['args']):
+        # For debugging -very_quiet should be removed but no usefull output in that case
+        options['args']['spatch'] = "-very_quiet -no_show_diff -D report -ignore-unknown-options"
+
+    # always forbid gcc to wrap lines of its output
+    if (tool == 'gcc' and "-fmessage-length=0" not in options['args']['gcc']):
+        options['args']['gcc'] += " -fmessage-length=0"
+
+
+def parse_options():
+    """The user interface of this module."""
+    usage = "%prog [options] <filename>\n\n"                                 \
+            "This tool needs to run in a Linux source tree.\n\nVampyr is a " \
+            "configurability aware driver for static analysis in a source "  \
+            "tree.\nEither the variability can be analyzed or source files " \
+            "can be compile tested."
+
+    parser = OptionParser(usage=usage)
+
+    parser.add_option('-v', '--verbose', dest='verbose', action='count',
+                      help="Increase verbosity (specify multiple times for "
+                           "more)")
+    parser.add_option("-O", '--args', dest='args', action='append',
+                      type="string", default=[],
+                      help="Add options to called programs, like -Osparse,"
+                           "-Wall")
+    parser.add_option("-C", '--call', dest='call', action='append',
+                      type="string", default=[],
+                      help="Add static analyzers to call stack, like -C gcc "
+                           "-C sparse")
+    parser.add_option("", '--cross-prefix', dest='cross_prefix', type='string',
+                      default="",
+                      help="Use a cross-toolchain, (e.g. 'arm-linux-gnueabi'")
+    parser.add_option("", '--exclude-others', dest='exclude_others',
+                      action='store_true', default=False,
+                      help="Suppress warnings in '#included' source files")
+    parser.add_option("-f", '--framework', dest='framework', action='store',
+                      type="string", default=None,
+                      help="Select build framework (one of 'bare', 'kbuild')")
+    parser.add_option("-m", '--model', dest='model', action='store',
+                      type="string", default=None,
+                      help="Use the given model. Only used with the bare-build "
+                           "framework")
+    parser.add_option('-A', '--algorithm', dest='coverage_strategy',
+                      action='store', default='min',
+                      help='Coverage calculation algorithm, default "min"')
+    parser.add_option('-a', '--analyze', dest='do_analyze', action='store_true',
+                      default=False, help="Analyze variability")
+    parser.add_option('-e', '--expand', dest='do_expansion',
+                      action='store_true',
+                      help="Try to expand the given partial configuration")
+    parser.add_option('-b', '--batch', dest='batch_mode', action='store_true',
+                      default=False,
+                      help="Operate in batch mode, read filenames from given "
+                           "worklists")
+    parser.add_option('-k', '--keep-configurations', dest='keep_configurations',
+                      action='store_true', default=False,
+                      help="Don't calculate partial configurations when they "
+                           "already exist")
+    parser.add_option('-t', '--threads', dest='threads', action='store',
+                      type='int', default=0,
+                      help="Number of parallel threads for undertaker dead "
+                           "analysis")
+    parser.add_option('-c', '--config', dest='configfile',
+                      help="Analyze a given configuration in config.h format")
+    parser.add_option('-s', '--strategy', dest='strategy', action='store',
+                      default='alldefconfig',
+                      help="Select how partial configurations get expanded")
+    parser.add_option('', '--stdconfig', dest='stdconfig',
+                      default=None,
+                      help="Use the given default configuration. Can be one of "
+                           "'allyesconfig', 'allnoconfig', 'allmodconfig', "
+                           "'alldefconfig' (defaults to 'allyesconfig')")
+    parser.add_option("-T", "--tests-dir", dest='testsdir', action='store',
+                      type='string', default="scripts/coccinelle",
+                      help="Directory containing the tests that should be run "
+                           "with the program")
+    parser.add_option("-K", "--kconfig-configurations", dest='configurations',
+                      action='store', default=None,
+                      help="Batch file with predefined Kconfig configurations")
+    parser.add_option("-W", "--whitelist", dest='whitelist', action='store',
+                      default=None,
+                      help="Use this whitelist when calculating configurations")
+    parser.add_option("-B", "--blacklist", dest='blacklist', action='store',
+                      default=None,
+                      help="Use this blacklist when calculating configurations")
+
+    (opts, args) = parser.parse_args()
+
+    tools.setup_logging(opts.verbose)
+
+    if len(args) < 1:
+        parser.print_help()
+        sys.exit("Please specify parameters!")
+
+    if opts.do_analyze is True and len(opts.call) > 0:
+        parser.print_help()
+        sys.exit("Cannot use -a and -C {gcc, sparse, spatch} at the same time!")
+
+    options = { 'args': {},
+                'keep_configurations': opts.keep_configurations,
+                'cross_prefix': opts.cross_prefix,
+                'threads': tools.get_online_processors() if opts.threads == 0 else opts.threads,
+                'exclude_others': opts.exclude_others,
+                'model': opts.model,
+                'coverage_strategy': opts.coverage_strategy,
+                'expansion_strategy': opts.strategy,
+                'loglevel': logging.getLogger().getEffectiveLevel(),
+                }
+
+    if opts.whitelist:
+        if os.path.exists(opts.whitelist):
+            options['whitelist'] = opts.whitelist
+        else:
+            sys.exit("Whitelist %s does not exist." % opts.whitelist)
+
+    if opts.blacklist:
+        if os.path.exists(opts.blacklist):
+            options['blacklist'] = opts.blacklist
+        else:
+            sys.exit("Blacklist %s does not exist" % opts.blacklist)
+
+    for arg in opts.args:
+        if not "," in arg:
+            sys.exit("Couldn't parse --args argument: %s" % arg)
+        (key, value) = arg.split(",", 1)
+        options['args'][key] = value
+
+    return (opts, args, options)
+
+
+def main():
+    """Main function of this module."""
+    # this method has too many branches (18/12)
+    # pylint: disable=R0912
+    (opts, args, options) = parse_options()
+
+    options['framework'] = BuildFrameworks.select_framework(opts.framework, options)
+
+    if opts.stdconfig and options['framework'].identifier() == 'kbuild':
+        if not opts.stdconfig in ('allyesconfig', 'allnoconfig', 'allmodconfig', 'alldefconfig'):
+            sys.exit("Invalid or Unknown standard configuration")
+        logging.info("Setting default configuration %s", opts.stdconfig)
+        options['stdconfig'] = opts.stdconfig
+        if opts.configfile:
+            sys.exit("Trying to set a standard config together with a config file, aborting.")
+
+    if not opts.stdconfig:
+        options['stdconfig'] = "allyesconfig"
+
+    if opts.configurations:
+        if os.path.exists(opts.configurations):
+            options['configurations'] = tools.calculate_worklist([opts.configurations], True)
+            logging.info("Restricting analysis to batch file %s (%d configurations)",
+                         opts.configurations, len(options['configurations']))
+        else:
+            sys.exit("Kconfig file list '%s' does not exist, aborting." % opts.configurations)
+
+    if opts.configfile:
+        if os.path.exists(opts.configfile):
+            logging.info("Restricting analysis to %s", opts.configfile)
+            options['configfile'] = opts.configfile
+        else:
+            sys.exit("Configfile %s does not exist, aborting." % opts.configfile)
+
+    if opts.do_analyze:
+        source_files = tools.calculate_worklist(args, opts.batch_mode)
+        analyze_variability(source_files, options)
+        sys.exit(0)
+
+    if opts.do_expansion:
+        bf = options['framework']
+        worklist = tools.calculate_worklist(args, batch_mode=opts.batch_mode)
+        success, fail = expand_partial_configurations(bf, worklist)
+        print "Total OK: %d, Total FAIL: %d" % (len(success), len(fail))
+        sys.exit(0)
+
+    # a list of tool names without arguments!
+    options['call'] = []
+
+    if len(opts.call) == 0:
+        sys.exit("Please use the -C option to specify what static analyzers to use")
+
+    for call in opts.call:
+        # call may contain something like 'gcc,-fno-inline-functions-called-once -fno-unused'
+
+        # NB: options['call'][tool] must contain both tool and arguments!
+        if ',' in call:
+            tool, tool_arguments = call.split(",")
+            options['call'].append(tool)
+            options['args'][tool] = tool_arguments
+        else:
+            tool = call
+            options['call'].append(tool)
+
+        # check if tool exists in path
+        check_tool(tool)
+        # if needed, add default options
+        add_default_options(call, tool, options)
+
+    spatches, _ = tools.execute("find %s -name '*.cocci'" % opts.testsdir)
+    options['test'] = sorted(spatches)
+
+    for tool in ("fakecc", "make --version"):
+        if not tools.check_tool(tool):
+            sys.exit("Tool '%s' not found!" % tool)
+
+    for fn in tools.calculate_worklist(args, batch_mode=opts.batch_mode):
+        handle_file(options, fn)
+
+
+if __name__ == "__main__":
+    main()

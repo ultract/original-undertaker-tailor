@@ -1,0 +1,20 @@
+#ifdef ABC
+
+B0 1
+
+#elif BCD
+
+#ifdef CONFIG_BAR
+
+B2 0
+#endif
+
+B1 0
+#endif
+
+#ifdef CONFIG_BAR
+
+B3 0
+#endif
+
+B00 3

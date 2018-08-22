@@ -1,0 +1,26 @@
+menuconfig FLIPPER_TRACE
+	bool "Flipper trace support"
+	default n
+	help
+		If you say yes here, the kernel will generate a detailed feature trace.
+		Warning: This only has effect on a kernel source prepared with the
+		flipper.cocci coccinelle script!
+
+if FLIPPER_TRACE
+
+config FLIPPER_TRACE_ENTRIES
+	int "Number of possible entries"
+	default 400000
+	help
+		The kernel reserves only this amount of entries.
+		If your source has a higher maximum index, unexpected results may occur.
+
+config FLIPPER_TRACE_ONE_ENTRY_PER_INDEX
+	bool "Write only one entry per index"
+	default y
+	help
+		This option increases the bitmap size by a factor of 8, but at the same
+		time decreases the instructions needed for each marker from 3 to 1.
+
+endif
+

@@ -1,0 +1,17 @@
+#!/bin/bash
+
+passed=0
+total=0
+
+for f in *.c; do
+  if ! PATH=..:/usr/local/bin:$PATH ./test-defines.py -v0 $f; then
+    echo "FAILED $f";
+  else
+    echo "PASSED $f"
+    passed=$(( $passed + 1 ))
+  fi
+  total=$(( $total + 1 ))
+done
+
+echo "$passed/$total checks passed"
+[ $passed -eq $total ] || exit 1

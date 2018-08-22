@@ -1,0 +1,71 @@
+Flipper: Lightweight Kernel Tailoring
+
+Configuring Linux is hard. With over 14,000 options to choose from, making an
+informed decision about every single one of them takes a very long time.
+
+While distributions for standard day-to-day use simply enable as many features
+(drivers, supported platforms, ...) as possible, this is not a practical
+solution for embedded systems, where memory is scarce and must not be wasted.
+
+To make it easier for an engineer to derive a small starting point to configure
+their system, we developed Flipper. Flipper provides a lean method to trace
+which functionality was exerted in the kernel. Using the Tailor tool from the
+undertaker package, a small, use-case specific configuration for Linux can be
+generated from the collected data.
+
+
+To prepare a kernel source directory, you need the semantic patch tool
+Coccinelle (spatch, more information at http://coccinelle.lip6.fr/).
+	./flipper/analyze.sh -i -b -B flipper/blacklist -m out.map -o out.patch -v path/to/linux-src/
+
+The patch can be applied to the kernel using the traditional patch util:
+	patch -p1 -d path/to/linux-src/ < out.patch
+
+Additionally, it is necessary to integrate the Flipper char device into the
+kernel.
+First, copy the required source files into the source folder
+	cp -r flipper/kernel/* path/to/linux-src/
+
+Then you need to modify the following files to include the device into the
+build process:
+	In drivers/misc/Kconfig
+		add
+			source "drivers/misc/flipper/Kconfig"
+		before
+			endmenu
+			[end of file]
+	In drivers/misc/Makefile
+		add
+			obj-$(CONFIG_FLIPPER_TRACE)	+= flipper/
+		at the end of file
+	And in include/uapi/linux/Kbuild
+		add
+			header-y	+= flipper.h
+		at the end of file
+
+Now you are ready to build the kernel.
+To enable this code point tracer, you have to enable the Flipper device in the
+configuration (CONFIG_FLIPPER_TRACE).
+The value of CONFIG_FLIPPER_TRACE_ENTRIES must be equal or more than the number
+of injected codepoints (for simplicity the number of lines of the out.map file).
+We strongly recommend to enable CONFIG_FLIPPER_TRACE_ONE_ENTRY_PER_INDEX since
+it not only avoids race-conditions but also uses less recording instructions
+(at the cost of an increased size).
+
+Use your target device booted with the prepared kernel in a typical manner.
+At the end, don't forget to save the recorded trace using
+	cp -f /dev/flipper trace.bitmap
+
+You are able to resolve the source code points using the evaluateMap script:
+	./flipper/evaluateMap.sh trace.bitmap out.map > trace.list
+
+This file can be processed with the undertaker-tailor utility to generate your
+linux configuration (maybe, more parameters will be needed, see the output
+of "undertaker-tailor -h" or the README in the tailor/ subdirectory for further
+details):
+	undertaker-tailor -f trace.list
+
+Additional information about the approach can be found in
+	https://www4.cs.fau.de/Publications/2014/ruprecht_14_gpce.pdf
+	https://www4.cs.fau.de/Ausarbeitung/MA-I4-2014-09-Heinloth.pdf
+

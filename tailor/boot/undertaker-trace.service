@@ -1,0 +1,13 @@
+[Unit]
+Description=undertaker traceutil
+Documentation=https://vamos.informatik.uni-erlangen.de/trac/undertaker/wiki/UndertakerTailor
+
+[Service]
+ExecStart=/usr/sbin/undertaker-traceutil \
+            /sys/kernel/debug/tracing/trace_pipe \
+            /run/undertaker-trace.out \
+            /sys/kernel/debug/tracing/set_ftrace_notrace \
+            /proc/modules
+
+[Install]
+WantedBy=multi-user.target

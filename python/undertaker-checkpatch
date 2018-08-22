@@ -1,0 +1,650 @@
+#!/usr/bin/env python2
+
+"""Check a specified patch for variability related defects in a Linux tree."""
+
+# Copyright (C) 2014-2015 Valentin Rothberg <valentinrothberg@gmail.com>
+# Copyright (C) 2015 Andreas Ruprecht <andreas.ruprecht@fau.de>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import sys
+
+sys.path = [os.path.join(os.path.dirname(sys.path[0]), 'lib',
+                         'python%d.%d' % (sys.version_info[0],
+                                          sys.version_info[1]),
+                         'site-packages')] + sys.path
+
+import vamos.tools as tools
+import vamos.golem.kbuild as kbuild
+import vamos.defect_analysis as defect_analysis
+from vamos.block import Block
+from vamos.model import RsfModel, find_similar_symbols
+
+import re
+import glob
+import logging
+import shutil
+import tempfile
+import whatthepatch
+from optparse import OptionParser
+from collections import OrderedDict, defaultdict
+
+
+# regex expressions
+OPERATORS = r"&|\(|\)|\||\!"
+FEATURE = r"\w*[A-Z0-9]{1}\w*"
+CONFIG_DEF = r"^\s*(?:menu){,1}config\s+(" + FEATURE + r")\s*"
+EXPR = r"(?:" + OPERATORS + r"|\s|" + FEATURE + r")+"
+STMT = r"^\s*(?:if|select|depends\s+on)\s+" + EXPR
+SOURCE_FEATURE = r"(?:\W|\b)+[D]{,1}(CONFIG_" + FEATURE + r")"
+
+# regex objects
+REGEX_FILE_KCONFIG = re.compile(r".*Kconfig[\.\w+\-]*$")
+REGEX_FILE_KBUILD = re.compile(r".*(Kbuild|Makefile)")
+REGEX_FILE_SOURCE = re.compile(r".*\.[cSh]$")
+REGEX_FEATURE = re.compile(r"(" + FEATURE + r")")
+REGEX_KCONFIG_DEF = re.compile(CONFIG_DEF)
+REGEX_KCONFIG_EXPR = re.compile(EXPR)
+REGEX_KCONFIG_STMT = re.compile(STMT)
+REGEX_FILTER_FEATURES = re.compile(r"[A-Za-z0-9]$")
+REGEX_SOURCE_FEATURE = re.compile(SOURCE_FEATURE)
+
+
+def parse_options():
+    """The user interface of this module."""
+    usage = "%prog [options] <filename>\n\n"                               \
+            "This tool needs to run in a Linux source tree.\n\nSpecify a " \
+            "patch file to check if any defects are introduced,\nfixed, "  \
+            "changed, or if they remained present (unchanged)."
+
+    parser = OptionParser(usage=usage)
+
+    parser.add_option('-v', '--verbose', dest='verbose', action='count',
+                      help="Increase verbosity (specify multiple times for "
+                           "more)")
+    parser.add_option('-a', '--arch', dest='arch', action='store', default="",
+                      help="Generate models only for this architecture")
+    parser.add_option('-c', '--commit', dest='commit', action='store',
+                      default="",
+                      help="Check this commit instead of a patch file")
+    parser.add_option('-m', '--models', dest='models', action='store',
+                      default="", help="Use these models for analysis")
+    parser.add_option('-u', '--mus', dest='mus', action='store_true',
+                      default=False,
+                      help="Generate minimally unsatisfiable subformulas (MUS) "
+                           "for dead Kconfig defects")
+    parser.add_option('', '--force', dest='force', action='store_true',
+                      default=False,
+                      help="Reset current git tree even when it's dirty")
+    parser.add_option('', '--only-new', dest='only_new', action='store_true',
+                      default=False,
+                      help="Report only new reports")
+    parser.add_option('', '--archive', dest='archive',
+                      action='store_true', default=False,
+                      help="Archive all defects and their analysis reports in "
+                           "'reports.zip'")
+
+    (opts, args) = parser.parse_args()
+
+    tools.setup_logging(opts.verbose)
+
+    if not args or not os.path.exists(args[0]):
+        if not opts.commit:
+            sys.exit("Please specify a valid patch file or commit.")
+
+    if opts.models and not os.path.exists(opts.models):
+        sys.exit("The specified models do not exist.")
+
+    if opts.commit and tree_is_dirty() and not opts.force:
+        sys.exit("The current git tree is dirty (see 'git status').  "
+                 "Running this tool may\ndelete important data since it calls "
+                 "'git reset --hard' for some performance\nreasons.   Please "
+                 "run this tool in a clean git tree or pass '--force' if you\n"
+                 "want to ignore this warning and continue.")
+
+    if opts.commit:
+        return (opts, args)
+
+    if not apply_patch(args[0]):
+        sys.exit("The specified patch cannot be applied.")
+    else:
+        apply_patch(args[0], "-R")
+
+    return (opts, args)
+
+
+def main():
+    """Main function of this module."""
+    #pylint: disable=R0912
+    #pylint: disable=R0914
+    #pylint: disable=R0915
+    (opts, args) = parse_options()
+    if not kbuild.is_linux():
+        sys.exit("This tool needs to run inside a Linux tree.")
+
+    model_path = opts.models.rstrip('/')
+    blocks_a = {}
+    blocks_b = {}
+    kconfig_change = False
+    kbuild_change = False
+    patchfile = ""
+    old_head = ""
+
+    if opts.commit:
+        old_head = git_head()
+        patchfile = tempfile.NamedTemporaryFile().name
+        tools.execute("git show %s > %s" % (opts.commit, patchfile))
+        git_reset(opts.commit + '~')
+    else:
+        patchfile = args[0]
+
+    (worklist_a, worklist_b, removals, additions) = parse_patch(patchfile)
+
+    for item in list(worklist_a):
+        if REGEX_FILE_KCONFIG.match(item):
+            kconfig_change = True
+        if REGEX_FILE_KBUILD.match(item):
+            kbuild_change = True
+        if not REGEX_FILE_SOURCE.match(item) or not os.path.exists(item):
+            worklist_a.remove(item)
+
+    for item in list(worklist_b):
+        if REGEX_FILE_KCONFIG.match(item):
+            kconfig_change = True
+        if REGEX_FILE_KBUILD.match(item):
+            kbuild_change = True
+        if not REGEX_FILE_SOURCE.match(item):
+            worklist_b.remove(item)
+
+    if not opts.models:
+        # if no model is specified, we need to generate new ones
+        model_path = generate_models(arch=opts.arch)
+    elif opts.arch and not opts.arch + ".model" in model_path and \
+            not os.path.exists("%s/%s.model" % (model_path, opts.arch)):
+        # if there is no model for the specified arch, generate it
+        logging.info("Model for specified architecture is not present")
+        model_path = generate_models(arch=opts.arch)
+
+    # Load the old models
+    models, _ = load_models(model_path, opts.arch)
+
+    # Read old file preconditions
+    fp_dict_a = get_file_preconditions(models, opts.arch)
+
+    # Save old models for changed file preconditions
+    if os.path.isdir(model_path):
+        old_model_path = "./models_old"
+        shutil.copytree(model_path, old_model_path)
+    else:
+        os.mkdir("./models_old")
+        old_model_path = "./models_old/" + os.path.basename(model_path)
+        shutil.copy(model_path, old_model_path)
+
+    if opts.commit:
+        # set HEAD to opts.commit
+        git_reset(opts.commit)
+    else:
+        # apply patch
+        apply_patch(patchfile)
+
+    # for any Kconfig or Kbuild change we need to generate new models
+    if kconfig_change or kbuild_change:
+        model_path = generate_models(arch=opts.arch)
+
+    # load new RSF models (mandatory for later checks)
+    models, mainmodel = load_models(model_path, opts.arch)
+
+    # Read new file preconditions
+    fp_dict_b = get_file_preconditions(models, opts.arch)
+
+    # Check if file preconditions for any file have changed
+    for srcfile in tools.execute("git ls-files")[0]:
+        if not REGEX_FILE_SOURCE.match(srcfile):
+            continue
+        fvar = "FILE_" + kbuild.normalize_filename(srcfile)
+        if fvar in fp_dict_a and fvar in fp_dict_b:
+            for arch in set(fp_dict_a[fvar].keys()) & set(fp_dict_b[fvar].keys()):
+                if fp_dict_b[fvar][arch] != fp_dict_a[fvar][arch]:
+                    # File precondition has changed -> add to worklists
+                    worklist_a.add(srcfile)
+                    worklist_b.add(srcfile)
+                    break
+
+    # Here, we need to reset the tree in order to find defects which are already
+    # present in the state before the patch
+    if opts.commit:
+        git_reset(opts.commit + "~")
+    else:
+        apply_patch(patchfile, "-R")
+
+    # First, detect defects with _old_ models
+    blocks_a = defect_analysis.batch_analysis(worklist_a, old_model_path, "")
+    # remove defect reports
+    remove_reports(blocks_a)
+
+    # Now, move to the new state yet again to analyse the new state
+    if opts.commit:
+        git_reset(opts.commit)
+    else:
+        apply_patch(patchfile)
+    # Update the ranges of all blocks found in the old state
+    Block.parse_patchfile(patchfile, blocks_a)
+
+    # detect defects after applying the patch
+    flags = ""
+    if opts.mus:
+        logging.info("Generating MUS reports")
+        flags = "-u"
+
+    blocks_b = defect_analysis.batch_analysis(worklist_b, model_path, flags)
+
+    # compare blocks before and after the patch to detect if defects are
+    # new, repaired, changed classification or remained unchanged
+    defects = OrderedDict()
+    cpp_defects = False
+    for srcfile in sorted(worklist_a | worklist_b):
+        list_a = blocks_a.get(srcfile, [])
+        list_b = blocks_b.get(srcfile, [])
+        defects[srcfile] = defect_analysis.compare_blocks(list_a, list_b)
+        if defects[srcfile]:
+            cpp_defects = True
+
+    # check each defect (dead and undead block) and print its report
+    if cpp_defects:
+        cpp_reports = []
+        cpp_defects_list = []
+
+        for srcfile in defects:
+            # if we're inside arch/*/, set the correct main model
+            is_arch_file = re.match(r"^arch/(\w+)/.*", srcfile)
+            if is_arch_file:
+                file_arch = is_arch_file.group(1)
+                new_mainmodel = [model for model in models if
+                                 file_arch == model.arch]
+                if len(new_mainmodel) == 1:
+                    mainmodel = new_mainmodel[0]
+                else:
+                    logging.warn("Could not change main model for %s to %s: "
+                                 "model does not exist!", srcfile, file_arch)
+
+            for block in defects[srcfile]:
+                # repaired defects don't require further checks
+                if not opts.only_new and 'repaired' in block.report:
+                    cpp_reports.append(block.report)
+                    continue
+
+                if "missing" in block.defect:
+                    defect_analysis.check_missing_defect(block, mainmodel,
+                                                         models, opts.arch)
+                elif "kbuild" in block.defect:
+                    defect_analysis.check_kbuild_defect(block, models)
+                elif "kconfig" in block.defect:
+                    defect_analysis.check_kconfig_defect(block, mainmodel)
+                elif "code" in block.defect:
+                    defect_analysis.check_code_defect(block)
+
+                if opts.only_new:
+                    if "New defect:" in block.report:
+                        cpp_reports.append(block.report)
+                        cpp_defects_list.append(block)
+                    continue
+
+                cpp_reports.append(block.report)
+                cpp_defects_list.append(block)
+
+        if opts.archive and cpp_defects_list:
+            archive_defects(cpp_defects_list)
+
+        if cpp_reports:
+            print "----------------------- Reporting dead and undead " + \
+                  "blocks -----------------------"
+            print "\n".join(cpp_reports)
+            print ""
+        else:
+            # avoid to check MUS reports
+            cpp_defects = False
+
+    # check patch for referential integrity violations
+    violations = check_referential_integrity(removals, additions, models,
+                                             mainmodel)
+    if violations:
+        print "------------------ Reporting referential integrity " + \
+              "violations ------------------"
+        for violation in violations:
+            print violation
+        print ""
+
+    # if specified, print MUS reports
+    if opts.mus and cpp_defects:
+        mus_reports = []
+
+        for srcfile in defects:
+            for block in defects[srcfile]:
+                if block.mus:
+                    if opts.only_new:
+                        if "New defect:" in block.report:
+                            mus_reports.append(block.mus)
+                        continue
+                    mus_reports.append(block.mus)
+
+        if mus_reports:
+            print "----------------------- Reporting paths to MUS formulas " + \
+                  "-----------------------"
+            print "\n".join(mus_reports)
+            print ""
+
+    if opts.commit:
+        # revert to previous HEAD
+        git_reset(old_head)
+    else:
+        # revert previously applied patch
+        apply_patch(patchfile, "-R")
+
+    # Clean up old models and defect reports
+    shutil.rmtree("./models_old")
+    remove_reports(blocks_b)
+
+
+def remove_reports(srcfiles):
+    """Remove the defect reports of all blocks of all srcfiles."""
+    for sfile in srcfiles:
+        for block in srcfiles[sfile]:
+            if block.defect != "no_defect":
+                path = "%s.%s.%s" % (block.srcfile, block.bid, block.defect)
+                os.remove(path)
+                if os.path.exists("%s.analysis" % path):
+                    os.remove("%s.analysis" % path)
+
+
+def archive_defects(defects):
+    """Archive all defects and their analyses (i.e., block.report) in
+    'report.zip'."""
+    # write reports and analysis files to temporary file
+    tmp = tempfile.NamedTemporaryFile().name
+    with open(tmp, 'w') as fdtmp:
+        for block in defects:
+            path = "%s.%s.%s" % (block.srcfile, block.bid, block.defect)
+            fdtmp.write("%s\n" % path)
+            fdtmp.write("%s.analysis\n" % path)
+
+            with open('%s.analysis' % path, 'w') as fdanal:
+                fdanal.write(block.report)
+
+    # archive reports
+    tools.execute('zip -@ reports.zip < %s' % tmp)
+    os.remove(tmp)
+
+
+def tree_is_dirty():
+    """Return True if the current working tree is dirty (i.e., if any file has
+    been added, deleted, modified, renamed or copied but not committed)."""
+    (out, err) = tools.execute("git status --porcelain")
+    if err != 0:
+        sys.exit('\n'.join(out))
+    for line in out:
+        if re.findall(r"[URMADC]{1}", line[:2]):
+            return True
+    return False
+
+
+def git_head():
+    """Return commit hash of current HEAD."""
+    (out, _) = tools.execute("git rev-parse HEAD")
+    return out[0]
+
+
+def git_reset(commit):
+    """Reset current HEAD to commit.  Exit in case of an error."""
+    (out, err) = tools.execute("git reset --hard %s" % commit)
+    if err != 0:
+        sys.exit('\n'.join(out))
+
+
+def apply_patch(patchfile, flags=""):
+    """Apply @patchfile and return True if it could is applied successfully."""
+    (_, err) = tools.execute("git apply --index %s %s" % (patchfile, flags))
+    return err == 0
+
+
+def generate_models(arch):
+    """Generate models and return the absolute path to the model directory.
+    In case the model generation fails, then exit with an error message."""
+    try:
+        return tools.generate_models(arch=arch)
+    except (RuntimeError, OSError) as err:
+        sys.exit("Cannot generate models:\n%s" % err)
+
+
+def get_file_preconditions(models, arch=""):
+    """Extract file variables from the models in @models. Returns a dict
+    that maps {file_variable1 : { arch1 : condition1, arch2 : condition2, ...}.
+    If the @arch parameter is given, only load the file variables for that
+    architecture."""
+    preconditions = defaultdict(dict)
+
+    if arch:
+        for model in models[:]:
+            if model.arch == arch:
+                models = [model]
+                break
+
+    for model in models:
+        for var in model.keys():
+            if not var.startswith("FILE_"):
+                continue
+
+            if model[var] is None:
+                value = ""
+            else:
+                value = model[var]
+            preconditions[var][model.arch] = value
+
+    return preconditions
+
+
+def load_models(model_path, arch):
+    """Load and return a list of models and a main model in the given
+    models directory. In case an architecture is specified, only this model
+    will be loaded. Otherwise, the main model tries to default to x86."""
+    models = []
+    mainmodel = None
+
+    if model_path.endswith(".model"):
+        # single file
+        mainmodel = RsfModel(model_path, readrsf=False)
+        return [mainmodel], mainmodel
+
+    # model directory
+    if not model_path.endswith("/"):
+        model_path += "/"
+
+    # get all models in directory
+    model_files = glob.glob(model_path + "*.model")
+
+    if arch:
+        # load only the main model
+        for model in model_files:
+            if arch in model:
+                mainmodel = RsfModel(model, readrsf=False)
+                return [mainmodel], mainmodel
+
+    # default to x86 if no arch is specified and load all models
+    for model in model_files:
+        models.append(RsfModel(model, readrsf=False))
+        if models[-1].arch == "x86":
+            mainmodel = models[-1]
+
+    # if x86 model is absent, then take the first in the list
+    if not mainmodel:
+        mainmodel = models[0]
+    return models, mainmodel
+
+
+def search_item_tree(regex, fileregex=""):
+    """Return a list of files referencing @regex. Specify @fileregex to only
+    grep files that match this pattern."""
+    # the -w parameter forces grep to match at word boundaries
+    (references, _) = tools.execute("git grep -Iwn '%s' -- '%s'"
+                                    % (regex, fileregex))
+    # if there is no reference we get [""]
+    if references[0] == "":
+        return []
+    return references
+
+
+def get_line(grep):
+    """Return line information as int from @grep. Note that @grep has the
+    following format: file path:line number:line content."""
+    match = re.search(r"^[^:]+:(\d+):.+", grep)
+    return int(match.groups()[0])
+
+
+def get_file(grep):
+    """Return the file path from @grep. Note that @grep has the following
+    format: file path:line number:line content."""
+    match = re.search(r"^([^:]+):\d+:.+", grep)
+    return match.groups()[0]
+
+
+def get_references(feature):
+    """Return a list of files referencing @feature. Note that Kconfig features
+    are prefixed with 'CONFIG_' and may also be suffixed with '_MODULE' in C
+    code. Hence, we have 3 optional groups around feature to represent optional
+    pre/-suffixes. """
+    feature = feature[len('CONFIG_'):]
+    references = search_item_tree(r"\(-D\)\?CONFIG_" + feature + r"\(_MODULE\)\?")
+    references.extend(search_item_tree(feature, "*Kconfig*"))
+    # multi-level sorting: 1st key is the file, 2nd key is the line
+    return sorted(set(references), key=lambda x: (get_file(x), get_line(x)))
+
+
+def get_kconfig_definition(line):
+    """Return defined Kconfig item in @line or None."""
+    definition = REGEX_KCONFIG_DEF.findall(line)
+    if definition:
+        return definition[0]
+    else:
+        return None
+
+
+def check_referential_integrity(removals, additions, models, mainmodel):
+    """Check removed Kconfig features and all added lines for violations of the
+    referential integrity. Return a list of violation reports."""
+    if not removals and not additions:
+        return []
+
+    violations = []
+    # removed features in Kconfig files
+    for filepath in sorted(removals):
+        for feature in [x for x in removals[filepath] if
+                        not defect_analysis.in_models(x, models)]:
+            references = get_references(feature)
+            if not references:
+                continue
+            violations.append("\n%s is removed from %s but still referenced "
+                              "in:" % (feature[len('CONFIG_'):], filepath))
+            for reference in references:
+                violations.append("\t" + reference)
+
+    # added references on Kconfig features in any file type
+    for feature in [x for x in additions if
+                    not defect_analysis.in_models(x, models)]:
+        violations.append("\n%s is not defined in Kconfig but newly referenced "
+                          "in:" % feature[len('CONFIG_'):])
+        references = get_references(feature)
+        for reference in references:
+            violations.append("\t" + reference)
+        sims = find_similar_symbols(feature, mainmodel)
+        sims = [x[len("CONFIG_"):] for x in sims]
+        violations.append("\n\tSimilar symbols: %s" % ', '.join(sims))
+
+    return violations
+
+
+def parse_patch(patchfile):
+    """Parse @patchfile and return related data."""
+    #pylint: disable=R0912
+    diffs = None
+    worklist_a = set()
+    worklist_b = set()
+    removals = {}
+    additions = set()
+
+    # https://pypi.python.org/pypi/whatthepatch/0.0.2
+    with open(patchfile) as stream:
+        diffs = whatthepatch.parse_patch(stream.read())
+
+    for diff in diffs:
+        path = ""
+
+        # extend the worklists
+        if diff.header.old_path == diff.header.new_path:
+            path = diff.header.old_path
+            worklist_a.add(diff.header.old_path)
+            worklist_b.add(diff.header.old_path)
+        else:
+            # whatthepatch 0.0.3 removes the leading 'a/' or 'b/' itself through
+            # better parsing, so check if we really need to strip it away
+            old_path = diff.header.old_path
+            new_path = diff.header.new_path
+            if old_path.startswith('a/'):
+                old_path = old_path[2:]
+            if new_path.startswith('b/'):
+                new_path = new_path[2:]
+
+            path = new_path
+            worklist_a.add(old_path)
+            worklist_b.add(new_path)
+
+        # parse Kconfig file
+        if REGEX_FILE_KCONFIG.match(path):
+            # change = [line# before, line# after, text]
+            for change in diff.changes:
+                # Removed features ({menu}config FOO)
+                if change[0] and not change[1] and \
+                        REGEX_KCONFIG_DEF.match(change[2]):
+                    feature = get_kconfig_definition(change[2])
+                    if feature:
+                        removed = removals.get(path, set())
+                        removed.add("CONFIG_" + feature)
+                        removals[path] = removed
+
+                # added statements (if, select, depends on)
+                elif not change[0] and change[1] and \
+                        REGEX_KCONFIG_STMT.match(change[2]):
+                    for feature in REGEX_FEATURE.findall(change[2]):
+                        additions.add("CONFIG_" + feature)
+            if removals.get(path, []):
+                removals[path] = sorted(removals[path])
+
+        # parse any file that is no Kconfig, source or log file
+        elif not REGEX_FILE_SOURCE.match(path) and \
+                not "ChangeLog" in path and \
+                not ".log" in path:
+            # change = [line# before, line# after, text]
+            for change in diff.changes:
+                # any added line is interesting
+                if not change[0] and change[1] and \
+                        "CONFIG_" in change[2]:
+                    for feature in REGEX_SOURCE_FEATURE.findall(change[2]):
+                        if feature.endswith("_MODULE"):
+                            feature = feature[:-len("_MODULE")]
+                        additions.add(feature)
+
+    return (worklist_a, worklist_b, removals, sorted(additions))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+Item	Z	tristate
+Item	XY	boolean
+Item	ABC	tristate
+Item	DE	boolean
+Item	FG	tristate

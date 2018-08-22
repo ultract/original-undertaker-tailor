@@ -1,0 +1,94 @@
+#!/bin/bash
+
+PATH=..:/usr/local/bin:$PATH
+LC_MESSAGES=C
+export PATH LC_MESSAGES
+
+passed=0
+total=0
+
+
+function test_sb1250-mac_differences() {
+    total=$(( $total + 1 ))
+    if diff -q sb1250-mac.c.config$1; then
+        echo "FAILED: configs for sb1250-mac.c must be different"
+    else
+        passed=$(( $passed + 1 ))
+    fi
+
+    total=$(( $total + 1 ))
+    if diff -q sb1250-mac.c.source$1; then
+        echo "FAILED: sources for sb1250-mac.c must be different"
+    else
+        passed=$(( $passed + 1 ))
+    fi
+
+    total=$(( $total + 1 ))
+    if diff -q sb1250-mac.c.cppflags$1; then
+        echo "FAILED: cppflags for sb1250-mac.c must be different"
+    else
+        passed=$(( $passed + 1 ))
+    fi
+}
+
+for f in *.c; do
+  if ! ./test-coverage.py -v0 $f; then
+    echo "FAILED $f";
+  else
+    echo "PASSED $f"
+    passed=$(( $passed + 1 ))
+  fi
+  total=$(( $total + 1 ))
+done
+
+# now test the combined mode on sb1250-mac.c
+undertaker -q -j coverage -C min -O combined sb1250-mac.c
+if test "`ls -1 sb1250-mac.c.config? | wc -l`" -eq 3; then
+    passed=$(( $passed + 1 ))
+fi
+
+if test "`ls -1 sb1250-mac.c.source? | wc -l`" -eq 3; then
+    passed=$(( $passed + 1 ))
+fi
+
+if test "`ls -1 sb1250-mac.c.cppflags? | wc -l`" -eq 3; then
+    passed=$(( $passed + 1 ))
+fi
+
+total=$(( $total + 3 ))
+
+test_sb1250-mac_differences [01]
+test_sb1250-mac_differences [02]
+test_sb1250-mac_differences [12]
+
+# test formatCommented functionality
+total=$(( $total + 1 ))
+undertaker -q -j coverage -O exec:cat coverage-cat.c > coverage-cat.c.got
+if ! diff -q coverage-cat.c.got coverage-cat.c.expected; then
+    echo "FAILED: output for coverage-cat.c differs"
+    diff -u coverage-cat.c.got coverage-cat.c.expected
+else
+    passed=$(( $passed + 1 ))
+fi
+
+undertaker -q -j coverage -C min_decision -B blacklist -m /dev/null -O exec:cat blacklist.c > blacklist.c.blacklist.got
+total=$(( $total + 1 ))
+if ! diff -q blacklist.c.blacklist{,.got}; then
+    echo "FAILED: blacklist functionality"
+    diff -u blacklist.c.{got,blacklist}
+else
+    passed=$(( $passed + 1 ))
+fi
+
+undertaker -q -j coverage -C min_decision -W blacklist -m /dev/null -O exec:cat blacklist.c > blacklist.c.whitelist.got
+total=$(( $total + 1 ))
+if ! diff -q blacklist.c.whitelist{,.got}; then
+    echo "FAILED: whitelist functionality"
+    diff -u blacklist.c.{got,whitelist}
+else
+    passed=$(( $passed + 1 ))
+fi
+
+
+echo "$passed/$total checks passed"
+[ $passed -eq $total ] || exit 1

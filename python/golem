@@ -1,0 +1,233 @@
+#!/usr/bin/env python2
+
+"""golem - analyze feature dependencies in Linux makefiles"""
+
+# Copyright (C) 2011-2012 Reinhard Tartler <tartler@informatik.uni-erlangen.de>
+# Copyright (C) 2011-2012 Christian Dietrich <christian.dietrich@informatik.uni-erlangen.de>
+# Copyright (C) 2012-2014 Valentin Rothberg <valentinrothberg@googlemail.com>
+# Copyright (C) 2014-2015 Stefan Hengelein <stefan.hengelein@fau.de>
+# Copyright (C) 2015 Andreas Ruprecht <rupran@einserver.de>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import sys
+
+sys.path = [os.path.join(os.path.dirname(sys.path[0]), 'lib',
+                         'python%d.%d' % (sys.version_info[0],
+                                          sys.version_info[1]),
+                         'site-packages')] + sys.path
+
+import vamos
+import vamos.model as Model
+import vamos.tools as tools
+from vamos.golem.inference import Inferencer
+import vamos.golem.inference_atoms as inference_atoms
+import vamos.golem.kbuild as kbuild
+import vamos.vampyr.BuildFrameworks as BuildFrameworks
+import vamos.vampyr.utils as utils
+
+import logging
+from optparse import OptionParser
+
+
+def do_inference(args, arch, subarch):
+    # pylint: disable=R0204
+    path = ""
+    if len(args) > 0 and os.path.isdir(args[0]):
+        path = os.path.normpath(args[0])
+        logging.info("Limiting the constraints interferencing to subdirectory '%s'", path)
+
+    atoms = None
+    if os.path.exists("src/Modules.ia32"):
+        atoms = inference_atoms.FiascoInferenceAtoms()
+    elif arch is "busybox":
+        atoms = inference_atoms.BusyboxInferenceAtoms(path)
+    elif arch is "coreboot":
+        atoms = inference_atoms.CorebootInferenceAtoms(path)
+    else:
+        atoms = inference_atoms.LinuxInferenceAtoms(arch, subarch, path)
+
+    inferencer = Inferencer(atoms)
+    inferencer.calculate()
+
+
+def find_variables_in_directories(arch, args):
+    modelfile = Model.get_model_for_arch(arch)
+    if not modelfile:
+        sys.exit("%s not found, generate models using undertaker-kconfigdump" % modelfile)
+    logging.info("loading model %s", modelfile)
+
+    if not args:
+        args.append(".")
+
+    for arg in args:
+        if not os.path.isdir(arg):
+            logging.warning("Skipping %s, not a directory", arg)
+            continue
+        variables = kbuild.determine_buildsystem_variables_in_directory(arg, arch)
+        logging.info("Detected %d Kconfig variables in subdir %s", len(variables), arg)
+        model = Model.parse_model(modelfile)
+        model_vars = [x for x in variables if x in model]
+        model_vars += [x + "_MODULE" for x in model_vars if (x+"_MODULE") in model]
+        logging.debug("found %d items in check_subdir result: %s", len(model_vars), model_vars)
+        for var in sorted(variables):
+            print var
+
+
+def main():
+    # this method has too many branches and statements
+    # pylint: disable=R0912
+    # pylint: disable=R0915
+    usage = "%prog [options]\n\n"                                          \
+            "This tool needs to run in a Linux source tree.\n\nIt is "     \
+            "sensitive to the environment variables $ARCH and $SUBARCH.\n" \
+            "Change them to scan on specific architectures."
+
+    parser = OptionParser(usage=usage)
+
+    parser.add_option('-v', '--verbose', dest='verbose', action='count',
+                      help="Increase verbosity (specify multiple times for "
+                            "more)")
+    parser.add_option('-l', '--list', dest='do_list', action='store_true',
+                      help="List all object files that would be built in the "
+                           "current configuration")
+    parser.add_option('-e', '--expand', dest='partialconfig', action='store',
+                      default=None,
+                      help="Expand given partial configuration in the current "
+                           "configuration")
+    parser.add_option('-s', '--strategy', dest='strategy', action='store',
+                      default='alldefconfig',
+                      help="Select how partial configurations get expanded")
+    parser.add_option('-o', '--options', dest='do_opt', action='store_true',
+                      default=False,
+                      help="List configuration options mentioned in Linux "
+                           "makefiles")
+    parser.add_option('-c', '--compiled', dest='compiled', action='append',
+                      help="Check if a given file is compiled in the current "
+                           "configuration (this option can be given multiple "
+                           "times)")
+    parser.add_option('-i', '--inference', dest='inference',
+                      action='store_true',
+                      help="Inference makefile configurability for symbols "
+                           "given as arguments")
+    parser.add_option('-d', '--directory', dest='do_directory',
+                      action='store_true',
+                      help="Print variables in a subdirectory, uses '.' if "
+                           "not specified")
+    parser.add_option('-b', '--batch', dest='batch_mode', action='store_true',
+                      help="Operate in batch mode, read filenames from given "
+                           "worklists")
+
+    (opts, args) = parser.parse_args()
+
+    tools.setup_logging(opts.verbose)
+
+    arch = None
+    subarch = None
+
+    if kbuild.is_linux():
+        logging.info("detected a Linux tree")
+
+        if os.environ.has_key('ARCH'):
+            arch = os.environ['ARCH']
+
+        if os.environ.has_key('SUBARCH'):
+            subarch = os.environ['SUBARCH']
+
+        if not arch:
+            arch = vamos.default_architecture
+            subarch = kbuild.guess_subarch_from_arch(arch)
+            logging.warning("Environment variable $ARCH not set, defaulting to '%s/%s'",
+                            arch, subarch)
+        if not subarch:
+            subarch = kbuild.guess_subarch_from_arch(arch)
+    elif kbuild.is_busybox():
+        logging.info("detected a Busybox tree")
+        arch = 'busybox'
+    elif kbuild.is_coreboot():
+        logging.info("detected a Coreboot tree")
+        arch = 'coreboot'
+        if os.environ.has_key('SUBARCH'):
+            subarch = os.environ['SUBARCH']
+    else:
+        sys.exit("No supported software project found")
+
+    if opts.inference:
+        try:
+            do_inference(args, arch=arch, subarch=subarch)
+        except RuntimeError as error:
+            sys.exit("Calculating inferences failed: %s" % error)
+        sys.exit(0)
+
+    if opts.do_opt:
+        variables = kbuild.determine_buildsystem_variables(arch)
+        logging.info("Detected %d Kconfig variables in Makefiles", len(variables))
+        for var in sorted(variables):
+            print 'CONFIG_' + var
+        sys.exit(0)
+
+    if opts.do_directory:
+        find_variables_in_directories(arch, args)
+        sys.exit(0)
+
+    if opts.partialconfig:
+        if not os.path.exists(opts.partialconfig):
+            sys.exit("Partial config %s does not exist" % opts.partialconfig)
+
+        options = {
+            'arch' : arch,
+            'subarch': subarch,
+            'threads': tools.get_online_processors(),
+            'loglevel': logging.getLogger().getEffectiveLevel(),
+            'expansion_strategy': opts.strategy,
+            }
+
+        framework = BuildFrameworks.select_framework(None, options)
+        config_exp = framework.make_partial_configuration(opts.partialconfig)
+
+        if not Model.get_model_for_arch(arch):
+            logging.info("Model for arch %s absent, skipping verification", arch)
+            config_exp.expand(verify=False)
+        else:
+            try:
+                config_exp.expand(verify=True)
+            except utils.ExpansionError as error:
+                logging.warning(str(error))
+
+    if opts.do_list:
+        is_verbose = opts.verbose > 0
+        try:
+            files = kbuild.files_for_current_configuration(arch, subarch, is_verbose)
+            logging.info("Detected %d files with current configuration", len(files))
+            for f in sorted(files):
+                print f
+        except kbuild.TreeNotConfigured:
+            sys.exit("Your Linux tree is not configured, please configure it first")
+        sys.exit(0)
+    elif opts.compiled:
+        try:
+            for filename in opts.compiled:
+                status = kbuild.file_in_current_configuration(filename, arch, subarch)
+                print filename, status
+        except kbuild.TreeNotConfigured:
+            sys.exit("Your Linux tree is not configured, please configure it first")
+        sys.exit(0)
+    elif not opts.partialconfig:
+        parser.print_help()
+        sys.exit("No option given")
+
+
+if __name__ == "__main__":
+    main()

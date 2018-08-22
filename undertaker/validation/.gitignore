@@ -1,0 +1,14 @@
+# test-suite
+!*.model
+!*.cnf
+*.coverage
+*.diff
+*.got
+*.expected
+*.dead
+*.undead
+*.c.config*
+*.c.cppflags*
+*.c.source*
+*.plist
+config?.report.*
